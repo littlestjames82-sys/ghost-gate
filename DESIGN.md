@@ -72,3 +72,16 @@ GUI + CLI, in the Ghost Verify house style.
 - Gate never stores a GitHub token; it uses the environment token or
   the workspace connector route, same as the other tools.
 - Exit codes: 0 clean/done, 1 blocked or no-match, 2 usage/IO error.
+
+## Shipped
+- **v1.0 (Nov 18, 2026)** — core four + hygiene, watch-strings,
+  divergence guard (hard stop), protected branches,
+  must-stay-private. Proven end-to-end on a scratch repo (push,
+  diff, push, rollback) and dogfooded for this repo's first push.
+- **v1.1 (Nov 18, 2026)** — everything else in this spec: archive
+  deep-scan, auditable overrides, project gate commands, absorb
+  (non-overlap proceeds, true overlap stops), last-second re-check,
+  version-drafted commit messages, post-push pull-back, release
+  draft preparation, history sweep, observe-first onboarding,
+  batch sweeps. Each proven live against test repos before the
+  1.1 dogfood push.

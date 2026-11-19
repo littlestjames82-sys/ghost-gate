@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ghost Gate 1.0 - one gate between a local folder and GitHub.
+"""Ghost Gate 1.1 - one gate between a local folder and GitHub.
 
 Nothing reaches GitHub un-scanned, un-diffed, or un-recorded:
   scan     credential-shaped patterns, blocked filename classes and
@@ -22,6 +22,9 @@ Usage:
   python3 ghost_gate.py --push FOLDER owner/repo [branch] [--message M]
   python3 ghost_gate.py --rollback owner/repo [branch]
   python3 ghost_gate.py --journal [N]
+  python3 ghost_gate.py --history owner/repo [branch]
+  python3 ghost_gate.py --observe FOLDER owner/repo
+  python3 ghost_gate.py --batch BATCHFILE
   python3 ghost_gate.py --init-repo NAME [--public]
   python3 ghost_gate.py --selftest
 Exit codes: 0 ok, 1 blocked / mismatch, 2 usage or IO error.
@@ -39,7 +42,7 @@ import sys
 import threading
 import urllib.parse
 
-VERSION = "1.0"
+VERSION = "1.1"
 DB_PATH = os.path.expanduser("~/.ghost-gate.db")
 GH2_PATH = os.path.expanduser(
     "~/workspace/custom-connectors/custom.legacy-github/bin/gh2.py")
@@ -189,47 +192,142 @@ def load_rules(folder):
     return {}
 
 
+def _finding(path, line, kind, severity, line_text=None):
+    """A finding names the shape, never the secret. Its fingerprint is
+    a hash of path + kind + the flagged line's hash, so an override
+    can name one exact finding without storing what it matched."""
+    basis = line_text if line_text is not None else "filename"
+    digest = hashlib.sha256(basis.encode("utf-8", "replace")).hexdigest()
+    fp = hashlib.sha256(
+        ("%s|%s|%s" % (path, kind, digest)).encode()).hexdigest()
+    return {"path": path, "line": line, "kind": kind,
+            "severity": severity, "fp": fp}
+
+
+def _scan_text(findings, path, text, watch):
+    for lineno, line in enumerate(text.splitlines(), 1):
+        for name, rx in BLOCK_PATTERNS:
+            if rx.search(line):
+                findings.append(_finding(path, lineno, name, "block",
+                                         line))
+        for name, rx in WARN_PATTERNS:
+            if rx.search(line):
+                findings.append(_finding(path, lineno, name, "warn",
+                                         line))
+        for idx, w in enumerate(watch):
+            if w in line:
+                findings.append(_finding(
+                    path, lineno, "watch-string #%d" % (idx + 1),
+                    "block", line))
+
+
+ARCHIVE_SUFFIXES = (".zip", ".apk", ".jar", ".tar.gz", ".tgz")
+
+
+def _scan_archive(findings, rel, full, watch):
+    """Deep scan: a key baked into a shipped archive is the worst
+    leak, so zip-family and tar entries are opened and their text
+    entries scanned with the same shapes. Entry paths are reported
+    as archive.zip!entry."""
+    import io
+    import tarfile
+    import zipfile
+    try:
+        if rel.lower().endswith((".zip", ".apk", ".jar")):
+            with zipfile.ZipFile(full) as zf:
+                for name in zf.namelist():
+                    if name.endswith("/"):
+                        continue
+                    verdict = filename_verdict(name)
+                    if verdict:
+                        findings.append(_finding(
+                            rel + "!" + name, 0, "filename-class",
+                            verdict))
+                    try:
+                        raw = zf.read(name)
+                    except Exception:
+                        continue
+                    if len(raw) > MAX_SCAN_BYTES or b"\0" in raw[:8192]:
+                        continue
+                    _scan_text(findings, rel + "!" + name,
+                               raw.decode("utf-8", errors="replace"),
+                               watch)
+        else:
+            with tarfile.open(full, "r:*") as tf:
+                for member in tf.getmembers():
+                    if not member.isfile():
+                        continue
+                    verdict = filename_verdict(member.name)
+                    if verdict:
+                        findings.append(_finding(
+                            rel + "!" + member.name, 0,
+                            "filename-class", verdict))
+                    fh = tf.extractfile(member)
+                    if fh is None:
+                        continue
+                    raw = fh.read(MAX_SCAN_BYTES + 1)
+                    if len(raw) > MAX_SCAN_BYTES or b"\0" in raw[:8192]:
+                        continue
+                    _scan_text(findings, rel + "!" + member.name,
+                               raw.decode("utf-8", errors="replace"),
+                               watch)
+    except Exception:
+        findings.append(_finding(rel, 0, "archive-unreadable", "warn"))
+
+
 def scan_tree(folder, tree, rules):
-    """Findings: {path, line, kind, severity}. Matched text is never
-    stored or printed; a finding names the shape, not the secret."""
+    """Findings: {path, line, kind, severity, fp}. Matched text is
+    never stored or printed; a finding names the shape, not the
+    secret."""
     findings = []
     watch = [w for w in rules.get("watch_strings", []) if w]
     for rel in sorted(tree):
         info = tree[rel]
         verdict = filename_verdict(rel)
         if verdict:
-            findings.append({"path": rel, "line": 0,
-                             "kind": "filename-class",
-                             "severity": verdict})
+            findings.append(_finding(rel, 0, "filename-class", verdict))
         if info["size"] > BLOCK_SIZE:
-            findings.append({"path": rel, "line": 0, "kind": "oversize",
-                             "severity": "block"})
+            findings.append(_finding(rel, 0, "oversize", "block"))
         elif info["size"] > WARN_SIZE:
-            findings.append({"path": rel, "line": 0, "kind": "oversize",
-                             "severity": "warn"})
+            findings.append(_finding(rel, 0, "oversize", "warn"))
+        full = os.path.join(folder, rel.replace("/", os.sep))
+        if rel.lower().endswith(ARCHIVE_SUFFIXES):
+            _scan_archive(findings, rel, full, watch)
+            continue
         if info["size"] > MAX_SCAN_BYTES:
             continue
-        full = os.path.join(folder, rel.replace("/", os.sep))
         with open(full, "rb") as fh:
             raw = fh.read()
         if b"\0" in raw[:8192]:
             continue  # binary: filename rules still applied above
-        text = raw.decode("utf-8", errors="replace")
-        for lineno, line in enumerate(text.splitlines(), 1):
-            for name, rx in BLOCK_PATTERNS:
-                if rx.search(line):
-                    findings.append({"path": rel, "line": lineno,
-                                     "kind": name, "severity": "block"})
-            for name, rx in WARN_PATTERNS:
-                if rx.search(line):
-                    findings.append({"path": rel, "line": lineno,
-                                     "kind": name, "severity": "warn"})
-            for idx, w in enumerate(watch):
-                if w in line:
-                    findings.append({"path": rel, "line": lineno,
-                                     "kind": "watch-string #%d" % (idx + 1),
-                                     "severity": "block"})
+        _scan_text(findings, rel, raw.decode("utf-8", errors="replace"),
+                   watch)
     return findings
+
+
+def is_overridden(finding, rules):
+    """An override names one finding by fingerprint (prefix match)
+    and must carry a written reason; both live in .ghostgate.json.
+    Returns the reason or None."""
+    for ov in rules.get("overrides", []):
+        fp = (ov.get("fp") or "").strip()
+        reason = (ov.get("reason") or "").strip()
+        if fp and reason and finding["fp"].startswith(fp):
+            return reason
+    return None
+
+
+def partition_overrides(findings, rules):
+    active, overridden = [], []
+    for f in findings:
+        reason = is_overridden(f, rules)
+        if reason:
+            g = dict(f)
+            g["reason"] = reason
+            overridden.append(g)
+        else:
+            active.append(f)
+    return active, overridden
 
 
 def blocks(findings):
@@ -474,10 +572,162 @@ def rehearse(gh, repo, folder, local, delta, base_tree, head, message):
     return commit_sha, tree_sha
 
 
+def run_gate_command(folder, rules, note):
+    cmd = rules.get("gate_command")
+    if not cmd:
+        return
+    import subprocess
+    note("Running project gate: %s" % cmd)
+    proc = subprocess.run(cmd, shell=True, cwd=folder,
+                          capture_output=True, text=True, timeout=900)
+    if proc.returncode != 0:
+        tail = (proc.stdout + proc.stderr).strip().splitlines()[-5:]
+        raise GateError("project gate failed (exit %d): %s"
+                        % (proc.returncode, " | ".join(tail)))
+
+
+def recheck_delta(folder, local, delta):
+    """Last-second re-check: the delta files are re-hashed right
+    before the ref moves. Anything that changed since the scan aborts
+    the landing; the rehearsed commit is simply never landed."""
+    for rel in delta["added"] + delta["changed"]:
+        full = os.path.join(folder, rel.replace("/", os.sep))
+        if not os.path.isfile(full):
+            raise GateError("re-check: %s vanished since the scan"
+                            % rel)
+        with open(full, "rb") as fh:
+            if blob_sha(fh.read()) != local[rel]["sha"]:
+                raise GateError(
+                    "re-check: %s changed since the scan; aborting "
+                    "before the ref moves" % rel)
+    for rel in delta["deleted"]:
+        full = os.path.join(folder, rel.replace("/", os.sep))
+        if os.path.isfile(full):
+            raise GateError("re-check: %s reappeared since the scan"
+                            % rel)
+
+
+VERSION_RXS = [
+    re.compile(r'VERSION\s*=\s*"([0-9]+\.[0-9]+(?:\.[0-9]+)?)"'),
+    re.compile(r'"version"\s*:\s*"([0-9]+\.[0-9]+(?:\.[0-9]+)?)"'),
+    re.compile(r'versionName\s*=?\s*"([0-9]+\.[0-9]+(?:\.[0-9]+)?)"'),
+    re.compile(r'(?m)^version\s*=\s*"([0-9]+\.[0-9]+(?:\.[0-9]+)?)"'),
+]
+
+
+def extract_version(text):
+    for rx in VERSION_RXS:
+        m = rx.search(text)
+        if m:
+            return m.group(1)
+    return None
+
+
+def fetch_blob(gh, repo, sha):
+    r = gh.call("GET", "/repos/%s/git/blobs/%s" % (repo, sha))
+    if r.get("encoding") == "base64":
+        return base64.b64decode(r["content"])
+    return (r.get("content") or "").encode()
+
+
+def draft_message(gh, repo, folder, local, remote, delta):
+    """If a changed file carries a version that moved, the commit is
+    named for it ('Ghost Gate 1.1'); otherwise (None, None) and the
+    caller falls back to the delta summary."""
+    display = repo.split("/")[-1].replace("-", " ").replace("_", " ")
+    display = display.title()
+    for rel in delta["changed"] + delta["added"]:
+        if local[rel]["size"] > MAX_SCAN_BYTES:
+            continue
+        full = os.path.join(folder, rel.replace("/", os.sep))
+        with open(full, "rb") as fh:
+            raw = fh.read()
+        if b"\0" in raw[:8192]:
+            continue
+        new_v = extract_version(raw.decode("utf-8", errors="replace"))
+        if not new_v:
+            continue
+        old_v = None
+        if rel in remote:
+            try:
+                old_raw = fetch_blob(gh, repo, remote[rel])
+                old_v = extract_version(
+                    old_raw.decode("utf-8", errors="replace"))
+            except GateError:
+                old_v = None
+        if new_v != old_v:
+            return "%s %s" % (display, new_v), new_v
+    return None, None
+
+
+def pull_back(gh, repo, branch, local, delta, is_private, note):
+    """Fetch key changed files from the raw public URL, the way a
+    visitor would, and hash-match them. Proves the world sees the
+    push, not just the API."""
+    import urllib.request
+    import urllib.error
+    targets = (delta["added"] + delta["changed"])[:3]
+    if not targets:
+        return
+    if is_private and not gh.token:
+        note("Pull-back skipped: private repo, no token route.")
+        return
+    for rel in targets:
+        url = "https://raw.githubusercontent.com/%s/%s/%s" % (
+            repo, urllib.parse.quote(branch, safe="/"),
+            urllib.parse.quote(rel, safe="/"))
+        req = urllib.request.Request(url)
+        req.add_header("User-Agent", "GhostGate/" + VERSION)
+        if gh.token:
+            req.add_header("Authorization", "Bearer " + gh.token)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = resp.read()
+        except urllib.error.URLError as e:
+            raise GateError(
+                "push landed and is journaled, but the pull-back "
+                "could not fetch %s (%s)" % (rel, e))
+        if blob_sha(data) != local[rel]["sha"]:
+            raise GateError(
+                "push landed and is journaled, but the pull-back of "
+                "%s does not hash-match the pushed file" % rel)
+    note("Pull-back verified %d file(s) from the raw URL."
+         % len(targets))
+
+
+def release_draft(repo, branch, version, result, delta):
+    """On a version bump, prepare the release draft and STOP. A push
+    is not a release; Gate never creates one."""
+    draft_dir = os.path.expanduser("~/ghost-gate-drafts")
+    os.makedirs(draft_dir, exist_ok=True)
+    name = repo.split("/")[-1]
+    path = os.path.join(draft_dir, "%s-%s.md" % (name, version))
+    lines = [
+        "# %s %s - release draft (prepared by Ghost Gate, NOT "
+        "published)" % (name.replace("-", " ").title(), version),
+        "",
+        "Push note: %s@%s -> %s" % (repo, branch,
+                                    (result["head"] or "")[:12]),
+        "Journal entry: %s" % result.get("journal", ""),
+        "",
+        "Changes in this push:",
+    ]
+    lines += ["- added: " + p for p in delta["added"]]
+    lines += ["- changed: " + p for p in delta["changed"]]
+    lines += ["- deleted: " + p for p in delta["deleted"]]
+    lines += ["", "Release notes:", "",
+              "(write the notes, then create the release yourself; "
+              "Ghost Gate prepared this draft and stopped, per the "
+              "authority boundary.)"]
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return path
+
+
 def push_flow(folder, repo, branch="main", message=None, gh=None,
               progress=None):
-    """The full gate. Returns a summary dict; raises GateError when the
-    gate stops the push."""
+    """The full gate. Returns a summary dict; raises GateError when
+    the gate stops the push."""
     def note(msg):
         if progress:
             progress(msg)
@@ -486,10 +736,16 @@ def push_flow(folder, repo, branch="main", message=None, gh=None,
     if branch in rules.get("protected_branches", []):
         raise GateError("branch %s is protected in .ghostgate.json"
                         % branch)
+    run_gate_command(folder, rules, note)
     note("Walking local tree...")
     local = local_tree(folder)
+    local_map = {p: v["sha"] for p, v in local.items()}
     note("Scanning %d files..." % len(local))
-    findings = scan_tree(folder, local, rules)
+    findings, overridden = partition_overrides(
+        scan_tree(folder, local, rules), rules)
+    for f in overridden:
+        note("Override applied: %s (%s) - %s"
+             % (f["path"], f["kind"], f["reason"]))
     bl = blocks(findings)
     if bl:
         raise GateError("scan blocked the push: %d blocking finding(s)"
@@ -499,21 +755,51 @@ def push_flow(folder, repo, branch="main", message=None, gh=None,
         raise GateError("guardrail: %s must stay private but is public"
                         % repo)
     head, base_tree, remote = gh.remote_state(repo, branch)
+    absorbed = 0
+    expected = local_map
+    delta = diff_trees(local, remote)
     last = journal_last_for(repo, branch)
     if last and head and last[4] and head != last[4]:
-        raise GateError(
-            "divergence guard: %s@%s moved outside Ghost Gate since "
-            "the last gated push (journal head %s, remote head %s). "
-            "Review the remote before pushing."
-            % (repo, branch, last[4][:8], head[:8]))
-    delta = diff_trees(local, remote)
+        # The remote moved outside Gate. Absorb when the changed
+        # sets do not truly overlap; stop only on a real conflict.
+        # Absorbing means the local delta is measured against the
+        # journal base and applied ONTO the current remote tree, so
+        # remote-only work survives the push.
+        base_map = gh.tree_map(repo, gh.commit_tree_sha(repo, last[4]))
+        remote_changed = {p for p in set(remote) | set(base_map)
+                          if remote.get(p) != base_map.get(p)}
+        local_changed = {p for p in set(local_map) | set(base_map)
+                         if local_map.get(p) != base_map.get(p)}
+        overlap = sorted(p for p in remote_changed & local_changed
+                         if local_map.get(p) != remote.get(p))
+        if overlap:
+            raise GateError(
+                "divergence guard: %s@%s moved outside Ghost Gate "
+                "and %d file(s) changed on both sides: %s"
+                % (repo, branch, len(overlap), ", ".join(overlap[:10])))
+        absorbed = len(remote_changed)
+        if absorbed:
+            note("Absorbing %d remote change(s) made outside the "
+                 "gate (no overlap)." % absorbed)
+            delta = diff_trees(local, base_map)
+            expected = dict(remote)
+            for p in delta["added"] + delta["changed"]:
+                expected[p] = local_map[p]
+            for p in delta["deleted"]:
+                expected.pop(p, None)
     if not (delta["added"] or delta["changed"] or delta["deleted"]):
-        return {"status": "clean", "findings": findings, "delta": delta,
-                "head": head}
+        return {"status": "clean", "findings": findings,
+                "overridden": overridden, "delta": delta, "head": head,
+                "absorbed": absorbed}
+    version = None
     if message is None:
-        message = ("Ghost Gate push: %d added, %d changed, %d deleted"
-                   % (len(delta["added"]), len(delta["changed"]),
-                      len(delta["deleted"])))
+        message, version = draft_message(gh, repo, folder, local,
+                                         remote, delta)
+        if message is None:
+            message = ("Ghost Gate push: %d added, %d changed, "
+                       "%d deleted" % (len(delta["added"]),
+                                       len(delta["changed"]),
+                                       len(delta["deleted"])))
     if "—" in message:
         raise GateError("commit message contains an em dash; "
                         "public copy rule")
@@ -538,33 +824,53 @@ def push_flow(folder, repo, branch="main", message=None, gh=None,
             entry_hash = journal_add(
                 "push", repo, branch, folder, None, head, base_tree,
                 1, 0, 0, 0, len(warns(findings)))
-            return {"status": "pushed", "findings": findings,
-                    "delta": delta, "head": head, "tree": base_tree,
-                    "journal": entry_hash}
+            result = {"status": "pushed", "findings": findings,
+                      "overridden": overridden, "delta": delta,
+                      "head": head, "tree": base_tree,
+                      "journal": entry_hash, "absorbed": absorbed,
+                      "version": version, "message": message}
+            pull_back(gh, repo, branch, local,
+                      {"added": [first], "changed": [], "deleted": []},
+                      info.get("private"), note)
+            if version:
+                result["release_draft"] = release_draft(
+                    repo, branch, version, result, delta)
+            return result
     note("Rehearsing commit (%d added, %d changed, %d deleted)..."
          % (len(delta["added"]), len(delta["changed"]),
             len(delta["deleted"])))
     commit_sha, tree_sha = rehearse(gh, repo, folder, local, delta,
                                     base_tree, head, message)
+    recheck_delta(folder, local, delta)
     note("Landing rehearsed commit %s..." % commit_sha[:8])
     gh.update_ref(repo, branch, commit_sha)
     new_head, _t, new_remote = gh.remote_state(repo, branch)
-    local_map = {p: v["sha"] for p, v in local.items()}
     if new_head != commit_sha:
         raise GateError("read-back failed: branch head %s is not the "
                         "rehearsed commit %s"
                         % (new_head, commit_sha))
-    if new_remote != local_map:
+    if new_remote != expected:
         raise GateError("read-back failed: remote tree does not match "
-                        "the local tree hash-for-hash")
+                        "the expected tree hash-for-hash")
     entry_hash = journal_add("push", repo, branch, folder, orig_head,
                              commit_sha, tree_sha,
                              len(delta["added"]) + boot_count,
                              len(delta["changed"]), len(delta["deleted"]),
                              0, len(warns(findings)))
+    result = {"status": "pushed", "findings": findings,
+              "overridden": overridden, "delta": delta,
+              "head": commit_sha, "tree": tree_sha,
+              "journal": entry_hash, "absorbed": absorbed,
+              "version": version, "message": message}
     note("Landed and verified.")
-    return {"status": "pushed", "findings": findings, "delta": delta,
-            "head": commit_sha, "tree": tree_sha, "journal": entry_hash}
+    pull_back(gh, repo, branch, local, delta, info.get("private"),
+              note)
+    if version:
+        result["release_draft"] = release_draft(repo, branch, version,
+                                                result, delta)
+        note("Release draft prepared (not published): %s"
+             % result["release_draft"])
+    return result
 
 
 def rollback(repo, branch="main", gh=None):
@@ -585,6 +891,133 @@ def rollback(repo, branch="main", gh=None):
     journal_add("rollback", repo, branch, "", head, prev_commit, None,
                 0, 0, 0, 0, 0)
     return {"status": "rolled-back", "from": head, "to": prev_commit}
+
+
+# --------------------------------------------------------------------------
+# History sweep, observe-first onboarding, batch sweeps
+# --------------------------------------------------------------------------
+
+def history_sweep(repo, branch=None, max_commits=200, gh=None,
+                  progress=None):
+    """Audit the remote repo's PAST commits for the same shapes. A
+    secret deleted today is still public in history; the sweep names
+    the blobs and commits so the credential can be rotated."""
+    def note(msg):
+        if progress:
+            progress(msg)
+    gh = gh or GH()
+    commits = []
+    page = 1
+    while len(commits) < max_commits:
+        path = "/repos/%s/commits?per_page=100&page=%d" % (repo, page)
+        if branch:
+            path += "&sha=" + urllib.parse.quote(branch, safe="/")
+        batch = gh.call("GET", path)
+        if not batch:
+            break
+        commits.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    commits = commits[:max_commits]
+    note("Walking %d commits..." % len(commits))
+    appearances = {}
+    path_findings = []
+    for c in commits:
+        tree = gh.tree_map(repo, gh.commit_tree_sha(repo, c["sha"]))
+        for p, sha in tree.items():
+            slot = appearances.setdefault(sha, {"paths": set(),
+                                                "commits": set()})
+            slot["paths"].add(p)
+            slot["commits"].add(c["sha"][:8])
+            verdict = filename_verdict(p)
+            if verdict == "block":
+                path_findings.append({"path": p, "commit": c["sha"][:8],
+                                      "kind": "filename-class"})
+    note("Scanning %d unique blobs..." % len(appearances))
+    blob_findings = []
+    fetched = 0
+    for sha, slot in appearances.items():
+        if fetched >= 1500:
+            note("Blob fetch cap reached; sweep is partial.")
+            break
+        try:
+            raw = fetch_blob(gh, repo, sha)
+        except GateError:
+            continue
+        fetched += 1
+        if len(raw) > MAX_SCAN_BYTES or b"\0" in raw[:8192]:
+            continue
+        text = raw.decode("utf-8", errors="replace")
+        kinds = set()
+        for line in text.splitlines():
+            for name, rx in BLOCK_PATTERNS:
+                if rx.search(line):
+                    kinds.add(name)
+        if kinds:
+            blob_findings.append({
+                "sha": sha[:12], "paths": sorted(slot["paths"]),
+                "commits": sorted(slot["commits"])[:5],
+                "kinds": sorted(kinds)})
+    return {"commits": len(commits), "blobs": len(appearances),
+            "blob_findings": blob_findings,
+            "path_findings": path_findings}
+
+
+def observe(folder, repo, gh=None):
+    """First contact with an unmanaged repo is observe-only: profile
+    it, draft proposed guardrails, change nothing."""
+    gh = gh or GH()
+    info = gh.repo_info(repo)
+    branch = info.get("default_branch") or "main"
+    head, _t, remote = gh.remote_state(repo, branch)
+    from collections import Counter
+    exts = Counter()
+    for p in remote:
+        base = os.path.basename(p)
+        exts[os.path.splitext(base)[1] or "(none)"] += 1
+    draft = {"must_stay_private": bool(info.get("private")),
+             "watch_strings": [], "protected_branches": [],
+             "gate_command": "", "overrides": []}
+    draft_path = None
+    if folder and os.path.isdir(folder):
+        draft_path = os.path.join(folder, ".ghostgate.draft.json")
+        with open(draft_path, "w", encoding="utf-8") as fh:
+            json.dump(draft, fh, indent=2)
+            fh.write("\n")
+    return {"repo": repo, "private": info.get("private"),
+            "default_branch": branch, "head": head,
+            "remote_files": len(remote), "top_extensions":
+            exts.most_common(5), "draft_path": draft_path,
+            "journaled": journal_last_for(repo, branch) is not None}
+
+
+def batch_sweep(batch_file, gh=None, progress=None):
+    """Each line of the batch file: FOLDER REPO [BRANCH]. Every pair
+    goes through the full gate; the board reports one verdict each."""
+    def note(msg):
+        if progress:
+            progress(msg)
+    gh = gh or GH()
+    results = []
+    with open(batch_file, "r", encoding="utf-8") as fh:
+        lines = [ln.strip() for ln in fh
+                 if ln.strip() and not ln.startswith("#")]
+    for ln in lines:
+        parts = ln.split()
+        folder, repo = parts[0], parts[1]
+        branch = parts[2] if len(parts) > 2 else "main"
+        note("== %s -> %s@%s" % (folder, repo, branch))
+        try:
+            r = push_flow(folder, repo, branch, gh=gh,
+                          progress=progress)
+            verdict = ("CLEAN" if r["status"] == "clean"
+                       else "PUSHED " + (r["head"] or "")[:8])
+            results.append((repo, branch, verdict))
+        except GateError as e:
+            results.append((repo, branch, "STOPPED: " + str(e)))
+            note("STOPPED: " + str(e))
+    return results
 
 
 # --------------------------------------------------------------------------
@@ -636,6 +1069,55 @@ def selftest():
           any(k.startswith("watch-string") for _p, k in kinds))
     check("ignored file never scanned",
           all(x["path"] != "skip.txt" for x in f))
+    # Deep scan: a token sealed inside a zip must still be caught.
+    import zipfile
+    with zipfile.ZipFile(os.path.join(bad, "pack.zip"), "w") as zf:
+        zf.writestr("inner.txt", "sealed ghp_" + "C" * 36 + "\n")
+    f2 = scan_tree(bad, local_tree(bad), load_rules(bad))
+    check("token inside a zip caught",
+          any(x["path"] == "pack.zip!inner.txt"
+              and x["kind"] == "github-token" for x in f2))
+    # Overrides: fingerprint + reason suppresses exactly one finding;
+    # a reason-less override suppresses nothing.
+    target = [x for x in f2 if x["path"] == "tokens.txt"
+              and x["kind"] == "github-token"][0]
+    rules_ov = {"watch_strings": ["999 TEST LANE"],
+                "overrides": [{"fp": target["fp"][:16],
+                               "reason": "documented test fixture"}]}
+    active, overridden = partition_overrides(f2, rules_ov)
+    check("override with reason suppresses its finding",
+          len(overridden) == 1
+          and all(x["fp"] != target["fp"] for x in active))
+    rules_bare = {"overrides": [{"fp": target["fp"][:16],
+                                 "reason": ""}]}
+    active2, overridden2 = partition_overrides(f2, rules_bare)
+    check("override without a reason suppresses nothing",
+          overridden2 == [] and len(active2) == len(f2))
+    # Project gate command.
+    try:
+        run_gate_command(bad, {"gate_command": "false"}, lambda m: None)
+        check("failing gate command stops the flow", False)
+    except GateError:
+        check("failing gate command stops the flow", True)
+    run_gate_command(bad, {"gate_command": "true"}, lambda m: None)
+    check("passing gate command lets the flow continue", True)
+    # Last-second re-check.
+    tree_b = local_tree(bad)
+    delta = {"added": [], "changed": ["tokens.txt"], "deleted": []}
+    recheck_delta(bad, tree_b, delta)
+    check("re-check passes on an untouched delta", True)
+    with open(os.path.join(bad, "tokens.txt"), "a") as fh:
+        fh.write("tampered after the scan\n")
+    try:
+        recheck_delta(bad, tree_b, delta)
+        check("re-check catches a file changed after the scan", False)
+    except GateError:
+        check("re-check catches a file changed after the scan", True)
+    # Version extraction for drafted commit messages.
+    check("version extraction (VERSION =)",
+          extract_version('VERSION = "1.2.3"') == "1.2.3")
+    check("version extraction (package.json)",
+          extract_version('{"version": "2.0.1"}') == "2.0.1")
     okc, count, bad_id = journal_verify()
     check("journal chain verifies (%d entries)" % count,
           okc or count == 0)
@@ -650,7 +1132,8 @@ def selftest():
 def _print_findings(findings):
     for f in findings:
         loc = f["path"] + ((":%d" % f["line"]) if f["line"] else "")
-        print("  [%s] %s (%s)" % (f["severity"].upper(), loc, f["kind"]))
+        print("  [%s] %s (%s) fp %s"
+              % (f["severity"].upper(), loc, f["kind"], f["fp"][:12]))
 
 
 def _print_delta(delta):
@@ -670,11 +1153,17 @@ def cli(argv):
         if argv[0] == "--scan" and len(argv) == 2:
             folder = argv[1]
             tree = local_tree(folder)
-            findings = scan_tree(folder, tree, load_rules(folder))
+            findings, overridden = partition_overrides(
+                scan_tree(folder, tree, load_rules(folder)),
+                load_rules(folder))
             print("Scanned %d files in %s" % (len(tree), folder))
             _print_findings(findings)
-            print("%d blocking, %d warning(s)"
-                  % (len(blocks(findings)), len(warns(findings))))
+            for f in overridden:
+                print("  [OVERRIDDEN] %s (%s) - %s"
+                      % (f["path"], f["kind"], f["reason"]))
+            print("%d blocking, %d warning(s), %d overridden"
+                  % (len(blocks(findings)), len(warns(findings)),
+                     len(overridden)))
             return 1 if blocks(findings) else 0
         if argv[0] == "--init-repo" and len(argv) >= 2:
             private = "--public" not in argv
@@ -717,13 +1206,68 @@ def cli(argv):
             if result["status"] == "clean":
                 print("Nothing to push; remote already matches.")
             else:
-                print("Pushed %s@%s -> %s"
-                      % (repo, branch, result["head"][:12]))
+                print("Pushed %s@%s -> %s (%s)"
+                      % (repo, branch, result["head"][:12],
+                         result.get("message", "")))
+            for f in result.get("overridden", []):
+                print("  [OVERRIDDEN] %s (%s) - %s"
+                      % (f["path"], f["kind"], f["reason"]))
             wn = warns(result["findings"])
             if wn:
                 print("Warnings:")
                 _print_findings(wn)
+            if result.get("release_draft"):
+                print("Release draft prepared (not published): %s"
+                      % result["release_draft"])
             return 0
+        if argv[0] == "--history" and len(argv) >= 2:
+            repo = argv[1]
+            branch = argv[2] if len(argv) > 2 else None
+            r = history_sweep(repo, branch,
+                              progress=lambda m: print("  " + m))
+            print("History sweep: %d commits, %d unique blobs"
+                  % (r["commits"], r["blobs"]))
+            for bf in r["blob_findings"]:
+                print("  [BLOCK] blob %s kinds %s in %s (commits %s)"
+                      % (bf["sha"], ", ".join(bf["kinds"]),
+                         ", ".join(bf["paths"][:3]),
+                         ", ".join(bf["commits"])))
+            for pf in r["path_findings"]:
+                print("  [BLOCK] %s (%s) at commit %s"
+                      % (pf["path"], pf["kind"], pf["commit"]))
+            bad = bool(r["blob_findings"] or r["path_findings"])
+            if bad:
+                print("If any of these were real credentials, rotate "
+                      "them; deleting the file today does not remove "
+                      "them from history.")
+            return 1 if bad else 0
+        if argv[0] == "--observe" and len(argv) >= 3:
+            r = observe(argv[1], argv[2])
+            print("Observed %s (nothing changed)" % r["repo"])
+            print("  visibility: %s" % ("private" if r["private"]
+                                        else "public"))
+            print("  default branch: %s, head: %s"
+                  % (r["default_branch"], (r["head"] or "none")[:12]))
+            print("  remote files: %d, top types: %s"
+                  % (r["remote_files"],
+                     ", ".join("%s x%d" % e
+                               for e in r["top_extensions"])))
+            print("  journaled before: %s" % r["journaled"])
+            if r["draft_path"]:
+                print("  proposed guardrails drafted at %s (rename "
+                      "to .ghostgate.json to adopt)"
+                      % r["draft_path"])
+            return 0
+        if argv[0] == "--batch" and len(argv) == 2:
+            results = batch_sweep(argv[1],
+                                  progress=lambda m: print("  " + m))
+            print("Batch board:")
+            failed = 0
+            for repo, branch, verdict in results:
+                print("  %s@%s: %s" % (repo, branch, verdict))
+                if verdict.startswith("STOPPED"):
+                    failed += 1
+            return 1 if failed else 0
         if argv[0] == "--rollback" and len(argv) >= 2:
             repo = argv[1]
             branch = argv[2] if len(argv) > 2 else "main"
@@ -807,6 +1351,8 @@ def run_gui():
                               ("Diff", self.on_diff),
                               ("Push through the gate", self.on_push),
                               ("Journal", self.on_journal),
+                              ("History", self.on_history),
+                              ("Observe", self.on_observe),
                               ("Rollback", self.on_rollback)]:
                 tk.Button(btns, text=text, bg=SURFACE, fg=TEXT1,
                           relief="flat", padx=10, pady=4,
@@ -878,16 +1424,23 @@ def run_gui():
 
             def fn():
                 tree = local_tree(folder)
-                findings = scan_tree(folder, tree, load_rules(folder))
+                findings, overridden = partition_overrides(
+                    scan_tree(folder, tree, load_rules(folder)),
+                    load_rules(folder))
                 lines = ["Scanned %d files." % len(tree)]
                 for f in findings:
                     loc = f["path"] + ((":%d" % f["line"])
                                        if f["line"] else "")
-                    lines.append("  [%s] %s (%s)"
-                                 % (f["severity"].upper(), loc, f["kind"]))
-                lines.append("%d blocking, %d warning(s)."
+                    lines.append("  [%s] %s (%s) fp %s"
+                                 % (f["severity"].upper(), loc,
+                                    f["kind"], f["fp"][:12]))
+                for f in overridden:
+                    lines.append("  [OVERRIDDEN] %s (%s) - %s"
+                                 % (f["path"], f["kind"], f["reason"]))
+                lines.append("%d blocking, %d warning(s), "
+                             "%d overridden."
                              % (len(blocks(findings)),
-                                len(warns(findings))))
+                                len(warns(findings)), len(overridden)))
                 return "\n".join(lines)
             self.run_worker(fn)
 
@@ -947,6 +1500,58 @@ def run_gui():
                         "  #%d %s %s %s@%s +%d ~%d -%d -> %s"
                         % (row[0], row[1], row[2], row[3], row[4],
                            row[7], row[8], row[9], (row[6] or "")[:8]))
+                return "\n".join(lines)
+            self.run_worker(fn)
+
+        def on_history(self):
+            try:
+                _f, repo, branch = self.inputs()
+                if not repo:
+                    raise GateError("enter a repo (owner/name)")
+            except GateError as e:
+                messagebox.showerror("Ghost Gate", str(e))
+                return
+
+            def fn():
+                r = history_sweep(repo, branch)
+                lines = ["History sweep: %d commits, %d unique blobs"
+                         % (r["commits"], r["blobs"])]
+                for bf in r["blob_findings"]:
+                    lines.append(
+                        "  [BLOCK] blob %s kinds %s in %s (commits %s)"
+                        % (bf["sha"], ", ".join(bf["kinds"]),
+                           ", ".join(bf["paths"][:3]),
+                           ", ".join(bf["commits"])))
+                for pf in r["path_findings"]:
+                    lines.append("  [BLOCK] %s (%s) at commit %s"
+                                 % (pf["path"], pf["kind"],
+                                    pf["commit"]))
+                if not (r["blob_findings"] or r["path_findings"]):
+                    lines.append("  No blocked shapes found in "
+                                 "history.")
+                return "\n".join(lines)
+            self.run_worker(fn)
+
+        def on_observe(self):
+            try:
+                folder, repo, _b = self.inputs()
+                if not repo:
+                    raise GateError("enter a repo (owner/name)")
+            except GateError as e:
+                messagebox.showerror("Ghost Gate", str(e))
+                return
+
+            def fn():
+                r = observe(folder, repo)
+                lines = ["Observed %s (nothing changed)" % r["repo"],
+                         "  visibility: %s"
+                         % ("private" if r["private"] else "public"),
+                         "  default branch: %s, remote files: %d"
+                         % (r["default_branch"], r["remote_files"]),
+                         "  journaled before: %s" % r["journaled"]]
+                if r["draft_path"]:
+                    lines.append("  proposed guardrails drafted at "
+                                 "%s" % r["draft_path"])
                 return "\n".join(lines)
             self.run_worker(fn)
 
